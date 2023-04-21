@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	containerType "github.com/docker/docker/api/types/container"
@@ -11,11 +14,49 @@ import (
 	"github.com/docker/docker/client"
 )
 
+const DEPENDHEAL_ENABLE_ALL_ENVAR = "DEPENDHEAL_ENABLE_ALL"
+
+type ContainerData struct {
+	ID     string
+	Name   string
+	Labels map[string]string
+}
+
+type RestartInvocation struct {
+	childContainerID string
+	childName        string
+	parentName       string
+}
+
+func restartChild(cli *client.Client, ctx context.Context, ri RestartInvocation) {
+	if ri.parentName != "" {
+		fmt.Printf("Restarting container: %s, depends on: %s\n", ri.childName, ri.parentName)
+	} else {
+		fmt.Printf("Restarting container: %s\n", ri.childName)
+	}
+
+	max_tries := 3
+	for i := 0; i < max_tries; i++ {
+		if err := cli.ContainerRestart(ctx, ri.childContainerID, containerType.StopOptions{}); err == nil {
+			break
+		}
+		_ = fmt.Errorf("Error when restarting container: %s, attempt: %d\n", ri.childName, i+1)
+	}
+}
+
+func restartChildren(cli *client.Client, ctx context.Context, restartInvocations []RestartInvocation) {
+	for _, restartInvocation := range restartInvocations {
+		go restartChild(cli, ctx, restartInvocation)
+	}
+}
+
 func main() {
 	cli, err := client.NewClientWithOpts(client.WithHost("unix:///var/run/docker.sock"))
 	if err != nil {
 		panic(err)
 	}
+
+	childRestartOnParentHealthy := make(map[string][]RestartInvocation)
 
 	ctx := context.Background()
 
@@ -26,13 +67,21 @@ func main() {
 		panic(err)
 	}
 
+	enable_all := false
+	if enable_all_envar, ok := os.LookupEnv(DEPENDHEAL_ENABLE_ALL_ENVAR); ok {
+		enable_all, err = strconv.ParseBool(enable_all_envar)
+		if err != nil {
+			_ = fmt.Errorf("Expected boolean for environment variable %s, provided %s", DEPENDHEAL_ENABLE_ALL_ENVAR, enable_all_envar)
+		}
+	}
+
 	// Find all containers that have dependheal.enable = true
-	watchedContainers := make(map[string]types.Container)
+	watchedContainers := make(map[string]ContainerData)
 	for _, container := range containers {
-		if hasLabel(container.Labels, "dependheal.enable", "true") {
+		if enable_all || hasLabel(container.Labels, "dependheal.enable", "true") {
 			name := strings.TrimPrefix(container.Names[0], "/")
 			fmt.Printf("Watching container: %s\n", name)
-			watchedContainers[container.ID] = container
+			watchedContainers[container.ID] = ContainerData{container.ID, name, container.Labels}
 		}
 	}
 
@@ -51,46 +100,62 @@ func main() {
 		case event := <-eventChan:
 			if event.Type == "container" {
 				if event.Action == "start" {
-					if hasLabel(event.Actor.Attributes, "dependheal.enable", "true") {
-						// quick n dirty, I need a types.Container type
-						var startedContainer types.Container
-						containers, _ := cli.ContainerList(ctx, types.ContainerListOptions{})
-						for _, container := range containers {
-							if container.ID == event.Actor.ID {
-								startedContainer = container
-							}
-						}
-						name := strings.TrimPrefix(startedContainer.Names[0], "/")
-						fmt.Printf("Watching container: %s\n", name)
-						watchedContainers[event.Actor.ID] = startedContainer
+					fmt.Println()
+					// Check if started container has dependheal.enable = true
+					if enable_all || hasLabel(event.Actor.Attributes, "dependheal.enable", "true") {
+						parentContainer := ContainerData{event.Actor.ID, event.Actor.Attributes["name"], event.Actor.Attributes}
+						fmt.Printf("Container started: %s\n", parentContainer.Name)
+						watchedContainers[parentContainer.ID] = parentContainer
+
+						children := make([]RestartInvocation, 0)
+						childrenOnHealthy := make([]RestartInvocation, 0)
 
 						for _, container := range watchedContainers {
-							parentName := strings.TrimPrefix(startedContainer.Names[0], "/")
-							if container.ID != startedContainer.ID && hasLabel(container.Labels, "dependheal.parent", parentName) {
-								childName := strings.TrimPrefix(container.Names[0], "/")
-								if false && hasLabel(container.Labels, "dependheal.wait_for_parent_healthy", "true") {
-									// We have to wait for the parent to be healthy, schedule the children to restart once we recieve that event
-									// TODO: implement
+							// Find all containers that have dependheal.parent = <PARENT_NAME>
+							if container.ID != parentContainer.ID && hasLabel(container.Labels, "dependheal.parent", parentContainer.Name) {
+								restartInvocation := RestartInvocation{container.ID, container.Name, parentContainer.Name}
+								// If dependheal.wait_for_parent_healthy = true, schedule restart once parent container is healthy
+								// Else restart chilren immediately
+								if hasLabel(container.Labels, "dependheal.wait_for_parent_healthy", "true") {
+									childrenOnHealthy = append(childrenOnHealthy, restartInvocation)
 								} else {
-									// If we don't have to wait for the parent to be healhy, let's restart the children now
-									if err := cli.ContainerRestart(ctx, container.ID, containerType.StopOptions{}); err != nil {
-										// TODO: handle error
-									}
-									fmt.Printf("Restarting container: %s, depends on: %s which just started\n", childName, parentName)
+									children = append(children, restartInvocation)
 								}
 							}
 						}
+						// Schedule restarts once parent is healthy
+						childRestartOnParentHealthy[parentContainer.ID] = childrenOnHealthy
+						// Restart children immediately
+						restartChildren(cli, ctx, children)
 					}
 				}
-				if _, ok := watchedContainers[event.Actor.ID]; ok {
+				if parentContainer, ok := watchedContainers[event.Actor.ID]; ok {
 					if event.Action == "stop" || event.Action == "die" {
-						name := strings.TrimPrefix(watchedContainers[event.Actor.ID].Names[0], "/")
-						fmt.Printf("Container stopped: %s\n", name)
-						delete(watchedContainers, event.Actor.ID)
+						fmt.Println()
+						fmt.Printf("Container stopped: %s\n", parentContainer.Name)
+						delete(watchedContainers, parentContainer.ID)
 					}
 
-					if event.Action == "health_status" {
-						// TODO: implement
+					if event.Action == "health_status: healthy" {
+						fmt.Println()
+						fmt.Printf("Container healthy: %s\n", parentContainer.Name)
+						if childrenToRestart, ok := childRestartOnParentHealthy[parentContainer.ID]; ok {
+							restartChildren(cli, ctx, childrenToRestart)
+							delete(childRestartOnParentHealthy, parentContainer.ID)
+						}
+					}
+					if event.Action == "health_status: unhealthy" {
+						fmt.Println()
+						fmt.Printf("Container unhealthy: %s\n", parentContainer.Name)
+						timeout := getLabelFloat(parentContainer.Labels, "dependheal.timeout", 0)
+						delayedRestart := func(cli *client.Client, ctx context.Context, ri RestartInvocation, timeout float64) {
+							if timeout != 0 {
+								fmt.Printf("Waiting for timeout of %.1f seconds before restarting %s\n", timeout, parentContainer.Name)
+							}
+							time.Sleep(time.Duration(timeout) * time.Second)
+							restartChild(cli, ctx, ri)
+						}
+						go delayedRestart(cli, ctx, RestartInvocation{parentContainer.ID, parentContainer.Name, ""}, timeout)
 					}
 				}
 			}
@@ -109,4 +174,23 @@ func hasLabel(labels map[string]string, key string, value string) bool {
 		return val == value
 	}
 	return false
+}
+
+// Helper function to get an decimal value from a label
+func getLabelFloat(labels map[string]string, key string, defaultValue float64) float64 {
+	if val, ok := labels[key]; ok {
+		// Attempt to parse the input string as a floating point number
+		floatVal, err := strconv.ParseFloat(val, 64)
+		if err == nil {
+			return floatVal
+		}
+		// Attempt to parse the input string as an integer
+		intVal, err := strconv.Atoi(val)
+		if err == nil {
+			return float64(intVal)
+		}
+		// Neither parsing attempt was successful
+		return defaultValue
+	}
+	return defaultValue
 }
