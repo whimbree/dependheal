@@ -1,5 +1,7 @@
 # Dependheal
 
+A docker container autorestart tool.
+
 ## Motivation
 When using docker-compose with the `network_mode: "service:parent_name"` option or docker with the `--net:container:parent_name`, the attached container will permanantly lose its network connection if the parent container restarts. 
 
@@ -12,9 +14,14 @@ There have been issues raised about this for many years on the Docker github, bu
 
 ## Setup
 Dependheal will listen to the docker daemon to know when a container starts or stops.
-Containers must have the `dependheal.enable=true` label for dependheal to listen for them.
+Containers must have the `dependheal.enable=true` label for Dependheal to listen for them.
+Alternatively, Dependheal will listen to all containers if the environment variable `DEPENDHEAL_ENABLE_ALL=true`.
 
-Any container with the `dependheal.parent=parent_name` label will be restarted automatically if the `parent_name` container restarts.
+Any container with the `dependheal.parent=<parent_name>` label will be restarted automatically if the `<parent_name>` container restarts.
+
+If the `dependheal.wait_for_parent_healthy=true` label is set, the container will be restarted once the parent container's healthcheck passes. Otherwise Dependheal will immediately restart it.
+
+Dependheal will also automatically restart containers that have failing healthchecks. To add a timeout between a container going unhealthy and Dependheal restarting it, add this label `dependheal.timeout=<timeout>` where `<timeout>` is either an integer or a floating point number. Otherwise Dependheal will immediately restart it.
 
 ## Usage
 Run `go mod download` to download dependencies.
