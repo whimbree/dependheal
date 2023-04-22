@@ -1,17 +1,13 @@
-FROM golang:1.19
-
-# Set destination for COPY
-WORKDIR /app
-
-# Download Go modules
+FROM docker.io/golang:alpine as builder
+WORKDIR /build
+# download go modules
 COPY go.mod go.sum ./
 RUN go mod download
-
-# Copy the source code
+# copy the source code
 COPY *.go ./
+# build
+RUN CGO_ENABLED=0 GOOS=linux go build -o dependheal .
 
-# Build
-RUN CGO_ENABLED=0 GOOS=linux go build -o /dependheal
-
-# Run
+FROM docker.io/alpine:latest
+COPY --from=builder /build/dependheal /dependheal
 CMD ["/dependheal"]
