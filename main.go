@@ -11,15 +11,17 @@ import (
 	"github.com/docker/docker/api/types"
 	containerType "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 )
 
 const DEPENDHEAL_ENABLE_ALL_ENVAR = "DEPENDHEAL_ENABLE_ALL"
 
 type ContainerData struct {
-	ID     string
-	Name   string
-	Labels map[string]string
+	ID       string
+	Name     string
+	Labels   map[string]string
+	Networks []string
 }
 
 type RestartContext struct {
@@ -40,7 +42,7 @@ func restartChild(cli *client.Client, ctx context.Context, restartContext Restar
 		if err := cli.ContainerRestart(ctx, restartContext.containerID, containerType.StopOptions{}); err == nil {
 			break
 		}
-		_ = fmt.Errorf("Error when restarting container: %s, attempt: %d\n", restartContext.containerName, i+1)
+		_ = fmt.Errorf("error when restarting container: %s, attempt: %d\n", restartContext.containerName, i+1)
 	}
 }
 
@@ -48,6 +50,10 @@ func restartChildren(cli *client.Client, ctx context.Context, RestartContexts []
 	for _, RestartContext := range RestartContexts {
 		go restartChild(cli, ctx, RestartContext)
 	}
+}
+
+func connectNetwork(cli *client.Client, ctx context.Context, networkID, containerID string) {
+	go cli.NetworkConnect(ctx, networkID, containerID, &network.EndpointSettings{})
 }
 
 func isContainerUnhealthy(cli *client.Client, ctx context.Context, containerID string) (bool, error) {
@@ -65,6 +71,29 @@ func delayedRestart(cli *client.Client, ctx context.Context, restartContext Rest
 	}
 	time.Sleep(time.Duration(timeout) * time.Second)
 	restartChild(cli, ctx, restartContext)
+}
+
+func getNetworkNameIDMapping(cli *client.Client, ctx context.Context) map[string]string {
+	// Create a mapping between networkName and networkID
+	networkNameIDMapping := make(map[string]string)
+	networks, _ := cli.NetworkList(ctx, types.NetworkListOptions{})
+	for _, network := range networks {
+		fmt.Printf("Network: %s, id: %s\n", network.Name, network.ID)
+		networkNameIDMapping[network.Name] = network.ID
+	}
+	return networkNameIDMapping
+}
+
+func parseCommaSeperatedList(stringList string) []string {
+	var returnList []string
+	splitStringList := strings.Split(stringList, ",")
+	for _, item := range splitStringList {
+		item = strings.TrimSpace(item)
+		if len(item) != 0 {
+			returnList = append(returnList, item)
+		}
+	}
+	return returnList
 }
 
 func main() {
@@ -86,7 +115,7 @@ func main() {
 	if enable_all_envar, ok := os.LookupEnv(DEPENDHEAL_ENABLE_ALL_ENVAR); ok {
 		enable_all, err = strconv.ParseBool(enable_all_envar)
 		if err != nil {
-			_ = fmt.Errorf("Expected boolean for environment variable %s, provided %s", DEPENDHEAL_ENABLE_ALL_ENVAR, enable_all_envar)
+			_ = fmt.Errorf("expected boolean for environment variable %s, provided %s", DEPENDHEAL_ENABLE_ALL_ENVAR, enable_all_envar)
 		}
 	}
 	if enable_all {
@@ -99,11 +128,16 @@ func main() {
 	for _, container := range containers {
 		if enable_all || hasLabel(container.Labels, "dependheal.enable", "true") {
 			name := strings.TrimPrefix(container.Names[0], "/")
-			fmt.Printf("Watching container: %s\n", name)
-			watchedContainers[container.ID] = ContainerData{container.ID, name, container.Labels}
+			// Encode dependheal.networks = network1, network2, ...
+			var networks []string
+			if networklabel, ok := container.Labels["dependheal.networks"]; ok {
+				networks = parseCommaSeperatedList(networklabel)
+			}
+			fmt.Printf("Watching container: %s networks: %v\n", name, networks)
+			watchedContainers[container.ID] = ContainerData{container.ID, name, container.Labels, networks}
 			isUnhealthy, err := isContainerUnhealthy(cli, ctx, container.ID)
 			if err != nil {
-				_ = fmt.Errorf("Checking health status of %s failed", name)
+				_ = fmt.Errorf("checking health status of %s failed", name)
 				continue
 			}
 			if isUnhealthy {
@@ -117,6 +151,18 @@ func main() {
 		fmt.Printf("Container unhealthy: %s\n", restartContext.containerName)
 		timeout := getLabelFloat(watchedContainers[restartContext.containerID].Labels, "dependheal.timeout", 0)
 		go delayedRestart(cli, ctx, restartContext, timeout)
+	}
+
+	networkNameIDMapping := getNetworkNameIDMapping(cli, ctx)
+
+	// Make sure every container is connected to its networks
+	for _, container := range watchedContainers {
+		for _, network := range container.Networks {
+			if networkID, ok := networkNameIDMapping[network]; ok {
+				fmt.Printf("Connecting container: %s to network: %s\n", container.Name, network)
+				connectNetwork(cli, ctx, networkID, container.ID)
+			}
+		}
 	}
 
 	// Listen for Docker events and act on them
@@ -137,11 +183,26 @@ func main() {
 		case event := <-eventChan:
 			if event.Type == "container" {
 				if event.Action == "start" {
+					// Update networkName -> networkID mapping
+					networkNameIDMapping = getNetworkNameIDMapping(cli, ctx)
 					// Check if started container has dependheal.enable = true
 					if enable_all || hasLabel(event.Actor.Attributes, "dependheal.enable", "true") {
-						parentContainer := ContainerData{event.Actor.ID, event.Actor.Attributes["name"], event.Actor.Attributes}
-						fmt.Printf("Container started: %s\n", parentContainer.Name)
+						// Encode dependheal.networks = network1, network2, ...
+						var networks []string
+						if networklabel, ok := event.Actor.Attributes["dependheal.networks"]; ok {
+							networks = parseCommaSeperatedList(networklabel)
+						}
+						parentContainer := ContainerData{event.Actor.ID, event.Actor.Attributes["name"], event.Actor.Attributes, networks}
 						watchedContainers[parentContainer.ID] = parentContainer
+						fmt.Printf("Container started: %s networks: %v\n", parentContainer.Name, parentContainer.Networks)
+
+						// Make sure container is connected to its networks
+						for _, network := range parentContainer.Networks {
+							if networkID, ok := networkNameIDMapping[network]; ok {
+								fmt.Printf("Connecting container: %s to network: %s\n", parentContainer.Name, network)
+								connectNetwork(cli, ctx, networkID, parentContainer.ID)
+							}
+						}
 
 						children := make([]RestartContext, 0)
 						childrenOnHealthy := make([]RestartContext, 0)
