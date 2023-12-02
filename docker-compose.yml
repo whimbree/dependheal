@@ -1,0 +1,10 @@
+version: '3'
+
+services:
+  dependheal:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      DEPENDHEAL_ENABLE_ALL: true

@@ -17,11 +17,16 @@ Dependheal will listen to the docker daemon to know when a container starts or s
 Containers must have the `dependheal.enable=true` label for Dependheal to listen for them.
 Alternatively, Dependheal will listen to all containers if the environment variable `DEPENDHEAL_ENABLE_ALL=true`.
 
+Dependheal will connect containers to networks if the `dependheal.networks` label exists on the container.
+This label accepts a comma delimited list of networks, i.e. `dependheal.networks = network1, network2`.
+
 Any container with the `dependheal.parent=<parent_name>` label will be restarted automatically if the `<parent_name>` container restarts.
 
 If the `dependheal.wait_for_parent_healthy=true` label is set, the container will be restarted once the parent container's healthcheck passes. Otherwise Dependheal will immediately restart it.
 
 Dependheal will also automatically restart containers that have failing healthchecks. To add a timeout between a container going unhealthy and Dependheal restarting it, add this label `dependheal.timeout=<timeout>` where `<timeout>` is either an integer or a floating point number. Otherwise Dependheal will immediately restart it.
+
+By default, dependheal will log messages at the info level. To get debug logging, pass the environment variable `DEBUG=true`.
 
 ## Usage
 Run `go mod download` to download dependencies.

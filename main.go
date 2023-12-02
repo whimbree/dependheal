@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -13,9 +12,13 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 const DEPENDHEAL_ENABLE_ALL_ENVAR = "DEPENDHEAL_ENABLE_ALL"
+const DEBUG_ENVAR = "DEBUG"
 
 type ContainerData struct {
 	ID       string
@@ -32,9 +35,9 @@ type RestartContext struct {
 
 func restartChild(cli *client.Client, ctx context.Context, restartContext RestartContext) {
 	if restartContext.parentContainerName != "" {
-		fmt.Printf("Restarting container: %s, depends on: %s\n", restartContext.containerName, restartContext.parentContainerName)
+		log.Info().Msgf("Restarting container: %s, depends on: %s", restartContext.containerName, restartContext.parentContainerName)
 	} else {
-		fmt.Printf("Restarting container: %s\n", restartContext.containerName)
+		log.Info().Msgf("Restarting container: %s", restartContext.containerName)
 	}
 
 	max_tries := 3
@@ -42,7 +45,7 @@ func restartChild(cli *client.Client, ctx context.Context, restartContext Restar
 		if err := cli.ContainerRestart(ctx, restartContext.containerID, containerType.StopOptions{}); err == nil {
 			break
 		}
-		_ = fmt.Errorf("error when restarting container: %s, attempt: %d\n", restartContext.containerName, i+1)
+		log.Error().Msgf("Error when restarting container: %s, attempt: %d", restartContext.containerName, i+1)
 	}
 }
 
@@ -67,7 +70,7 @@ func isContainerUnhealthy(cli *client.Client, ctx context.Context, containerID s
 
 func delayedRestart(cli *client.Client, ctx context.Context, restartContext RestartContext, timeout float64) {
 	if timeout != 0 {
-		fmt.Printf("Waiting for timeout of %.1f seconds before restarting %s\n", timeout, restartContext.containerName)
+		log.Info().Msgf("Waiting for timeout of %.1f seconds before restarting %s", timeout, restartContext.containerName)
 	}
 	time.Sleep(time.Duration(timeout) * time.Second)
 	restartChild(cli, ctx, restartContext)
@@ -78,7 +81,7 @@ func getNetworkNameIDMapping(cli *client.Client, ctx context.Context) map[string
 	networkNameIDMapping := make(map[string]string)
 	networks, _ := cli.NetworkList(ctx, types.NetworkListOptions{})
 	for _, network := range networks {
-		fmt.Printf("Network: %s, id: %s\n", network.Name, network.ID)
+		log.Debug().Msgf("Network: %s, id: %s", network.Name, network.ID)
 		networkNameIDMapping[network.Name] = network.ID
 	}
 	return networkNameIDMapping
@@ -97,6 +100,18 @@ func parseCommaSeperatedList(stringList string) []string {
 }
 
 func main() {
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339})
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	if debug_envar, ok := os.LookupEnv(DEBUG_ENVAR); ok {
+		debug, err := strconv.ParseBool(debug_envar)
+		if err != nil {
+			log.Error().Msgf("Expected boolean for environment variable %s, provided %s", DEBUG_ENVAR, debug_envar)
+		} else if debug {
+			zerolog.SetGlobalLevel(zerolog.DebugLevel)
+			log.Info().Msgf("Environment variable %s=true, debug logging enabled", DEBUG_ENVAR)
+		}
+	}
+
 	cli, err := client.NewClientWithOpts(client.WithHost("unix:///var/run/docker.sock"))
 	if err != nil {
 		panic(err)
@@ -115,11 +130,11 @@ func main() {
 	if enable_all_envar, ok := os.LookupEnv(DEPENDHEAL_ENABLE_ALL_ENVAR); ok {
 		enable_all, err = strconv.ParseBool(enable_all_envar)
 		if err != nil {
-			_ = fmt.Errorf("expected boolean for environment variable %s, provided %s", DEPENDHEAL_ENABLE_ALL_ENVAR, enable_all_envar)
+			log.Error().Msgf("Expected boolean for environment variable %s, provided %s", DEPENDHEAL_ENABLE_ALL_ENVAR, enable_all_envar)
 		}
 	}
 	if enable_all {
-		fmt.Printf("Environment variable %s=true, watching all containers\n", DEPENDHEAL_ENABLE_ALL_ENVAR)
+		log.Info().Msgf("Environment variable %s=true, watching all containers", DEPENDHEAL_ENABLE_ALL_ENVAR)
 	}
 
 	// Find all containers that have dependheal.enable = true
@@ -128,16 +143,20 @@ func main() {
 	for _, container := range containers {
 		if enable_all || hasLabel(container.Labels, "dependheal.enable", "true") {
 			name := strings.TrimPrefix(container.Names[0], "/")
-			// Encode dependheal.networks = network1, network2, ...
+			// Parse dependheal.networks = network1, network2, ...
 			var networks []string
 			if networklabel, ok := container.Labels["dependheal.networks"]; ok {
 				networks = parseCommaSeperatedList(networklabel)
 			}
-			fmt.Printf("Watching container: %s networks: %v\n", name, networks)
+			if enable_all == false {
+				log.Info().Msgf("Watching container: %s, networks: %v", name, networks)
+			} else {
+				log.Debug().Msgf("Watching container: %s, networks: %v", name, networks)
+			}
 			watchedContainers[container.ID] = ContainerData{container.ID, name, container.Labels, networks}
 			isUnhealthy, err := isContainerUnhealthy(cli, ctx, container.ID)
 			if err != nil {
-				_ = fmt.Errorf("checking health status of %s failed", name)
+				log.Error().Msgf("Checking health status of %s failed", name)
 				continue
 			}
 			if isUnhealthy {
@@ -148,7 +167,7 @@ func main() {
 
 	// Restart unhealthy containers
 	for _, restartContext := range unhealthyContainers {
-		fmt.Printf("Container unhealthy: %s\n", restartContext.containerName)
+		log.Info().Msgf("Container unhealthy: %s", restartContext.containerName)
 		timeout := getLabelFloat(watchedContainers[restartContext.containerID].Labels, "dependheal.timeout", 0)
 		go delayedRestart(cli, ctx, restartContext, timeout)
 	}
@@ -159,7 +178,7 @@ func main() {
 	for _, container := range watchedContainers {
 		for _, network := range container.Networks {
 			if networkID, ok := networkNameIDMapping[network]; ok {
-				fmt.Printf("Connecting container: %s to network: %s\n", container.Name, network)
+				log.Debug().Msgf("Connecting container: %s to network: %s", container.Name, network)
 				connectNetwork(cli, ctx, networkID, container.ID)
 			}
 		}
@@ -187,19 +206,19 @@ func main() {
 					networkNameIDMapping = getNetworkNameIDMapping(cli, ctx)
 					// Check if started container has dependheal.enable = true
 					if enable_all || hasLabel(event.Actor.Attributes, "dependheal.enable", "true") {
-						// Encode dependheal.networks = network1, network2, ...
+						// Parse dependheal.networks = network1, network2, ...
 						var networks []string
 						if networklabel, ok := event.Actor.Attributes["dependheal.networks"]; ok {
 							networks = parseCommaSeperatedList(networklabel)
 						}
 						parentContainer := ContainerData{event.Actor.ID, event.Actor.Attributes["name"], event.Actor.Attributes, networks}
 						watchedContainers[parentContainer.ID] = parentContainer
-						fmt.Printf("Container started: %s networks: %v\n", parentContainer.Name, parentContainer.Networks)
+						log.Info().Msgf("Container started: %s, networks: %v", parentContainer.Name, parentContainer.Networks)
 
 						// Make sure container is connected to its networks
 						for _, network := range parentContainer.Networks {
 							if networkID, ok := networkNameIDMapping[network]; ok {
-								fmt.Printf("Connecting container: %s to network: %s\n", parentContainer.Name, network)
+								log.Debug().Msgf("Connecting container: %s to network: %s", parentContainer.Name, network)
 								connectNetwork(cli, ctx, networkID, parentContainer.ID)
 							}
 						}
@@ -228,19 +247,19 @@ func main() {
 				}
 				if parentContainer, ok := watchedContainers[event.Actor.ID]; ok {
 					if event.Action == "stop" || event.Action == "die" {
-						fmt.Printf("Container stopped: %s\n", parentContainer.Name)
+						log.Info().Msgf("Container stopped: %s", parentContainer.Name)
 						delete(watchedContainers, parentContainer.ID)
 					}
 
 					if event.Action == "health_status: healthy" {
-						fmt.Printf("Container healthy: %s\n", parentContainer.Name)
+						log.Info().Msgf("Container healthy: %s", parentContainer.Name)
 						if childrenToRestart, ok := childRestartOnParentHealthy[parentContainer.ID]; ok {
 							restartChildren(cli, ctx, childrenToRestart)
 							delete(childRestartOnParentHealthy, parentContainer.ID)
 						}
 					}
 					if event.Action == "health_status: unhealthy" {
-						fmt.Printf("Container unhealthy: %s\n", parentContainer.Name)
+						log.Info().Msgf("Container unhealthy: %s", parentContainer.Name)
 						timeout := getLabelFloat(parentContainer.Labels, "dependheal.timeout", 0)
 						go delayedRestart(cli, ctx, RestartContext{parentContainer.ID, parentContainer.Name, ""}, timeout)
 					}
