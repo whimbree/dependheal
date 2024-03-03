@@ -148,7 +148,7 @@ func main() {
 			if networklabel, ok := container.Labels["dependheal.networks"]; ok {
 				networks = parseCommaSeperatedList(networklabel)
 			}
-			if enable_all == false {
+			if !enable_all {
 				log.Info().Msgf("Watching container: %s, networks: %v", name, networks)
 			} else {
 				log.Debug().Msgf("Watching container: %s, networks: %v", name, networks)
@@ -178,7 +178,7 @@ func main() {
 	for _, container := range watchedContainers {
 		for _, network := range container.Networks {
 			if networkID, ok := networkNameIDMapping[network]; ok {
-				log.Debug().Msgf("Connecting container: %s to network: %s", container.Name, network)
+				log.Info().Msgf("Connecting container: %s to network: %s", container.Name, network)
 				connectNetwork(cli, ctx, networkID, container.ID)
 			}
 		}
@@ -218,7 +218,7 @@ func main() {
 						// Make sure container is connected to its networks
 						for _, network := range parentContainer.Networks {
 							if networkID, ok := networkNameIDMapping[network]; ok {
-								log.Debug().Msgf("Connecting container: %s to network: %s", parentContainer.Name, network)
+								log.Info().Msgf("Connecting container: %s to network: %s", parentContainer.Name, network)
 								connectNetwork(cli, ctx, networkID, parentContainer.ID)
 							}
 						}
